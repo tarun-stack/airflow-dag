@@ -1,0 +1,120 @@
+from airflow import DAG
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+import subprocess
+from datetime import timedelta
+
+# Define the DAG
+dag = DAG(
+    'batch_job_pipeline',
+    default_args={
+        'start_date': days_ago(1),
+        'retries': 3,
+        'retry_delay': timedelta(minutes=5),
+    },
+    schedule_interval=None,
+    catchup=False
+)
+
+# Task 1: Wait for the batch job to complete
+wait_for_batch_job = BashOperator(
+    task_id='wait_for_batch_job',
+    bash_command='while [ ! -f /path/to/batch_job_complete.txt ]; do sleep 10; done',
+    dag=dag
+)
+
+# Task 2: Execute the generic Java SQL builder
+def execute_java_sql_builder(**kwargs):
+    config_params = kwargs['params']
+    java_jar_path = config_params.get('java_jar_path', '/path/to/your/java-sql-builder.jar')
+    input_file = config_params.get('input_file', '/path/to/input/file.csv')
+    output_file = config_params.get('output_file', '/path/to/output/file.sql')
+
+    java_command = f"java -jar {java_jar_path} --input {input_file} --output {output_file}"
+    print(f"Executing Java command: {java_command}")
+
+    process = subprocess.Popen(java_command.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, error = process.communicate()
+
+    if process.returncode != 0:
+        raise Exception(f"Java SQL Builder failed: {error.decode('utf-8')}")
+    print(output.decode('utf-8'))
+
+run_java_sql_builder = PythonOperator(
+    task_id='run_java_sql_builder',
+    python_callable=execute_java_sql_builder,
+    provide_context=True,
+    dag=dag
+)
+
+# Task 3: Enrich the data
+def enrich_data(**kwargs):
+    import cx_Oracle
+
+    def fetch_data_from_table():
+        dsn = cx_Oracle.makedsn(Variable.get("ORACLE_HOST"), Variable.get("ORACLE_PORT"), sid=Variable.get("ORACLE_SID"))
+        connection = cx_Oracle.connect(user=Variable.get("ORACLE_USER"), password=Variable.get("ORACLE_PASSWORD"), dsn=dsn)
+        cursor = connection.cursor()
+
+        query = "SELECT * FROM java_sql_builder_table"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+
+        cursor.close()
+        connection.close()
+
+        return rows
+
+    def perform_enrichment(data):
+        enriched_data = []
+        for row in data:
+            enriched_row = list(row)
+            enriched_row.append(len(row))  # Example enrichment
+            enriched_data.append(enriched_row)
+
+        return enriched_data
+
+    raw_data = fetch_data_from_table()
+    print(f"Retrieved {len(raw_data)} rows from the database.")
+
+    enriched_data = perform_enrichment(raw_data)
+    print("Enrichment completed.")
+
+    return enriched_data
+
+enrich_data_task = PythonOperator(
+    task_id='enrich_data',
+    python_callable=enrich_data,
+    provide_context=True,
+    dag=dag
+)
+
+# Task 4: Persist enriched data to Oracle database
+def persist_to_oracle(**kwargs):
+    enriched_data = kwargs['ti'].xcom_pull(task_ids='enrich_data')
+    import cx_Oracle
+
+    dsn = cx_Oracle.makedsn(Variable.get("ORACLE_HOST"), Variable.get("ORACLE_PORT"), sid=Variable.get("ORACLE_SID"))
+    connection = cx_Oracle.connect(user=Variable.get("ORACLE_USER"), password=Variable.get("ORACLE_PASSWORD"), dsn=dsn)
+    cursor = connection.cursor()
+
+    for row in enriched_data:
+        cursor.execute("INSERT INTO enriched_data_table (col1, col2, col3) VALUES (:1, :2, :3)", row)
+
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    print(f"Persisted {len(enriched_data)} rows to the Oracle database.")
+
+persist_to_oracle_task = PythonOperator(
+    task_id='persist_to_oracle',
+    python_callable=persist_to_oracle,
+    provide_context=True,
+    dag=dag
+)
+
+# Define the task dependencies
+wait_for_batch_job >> run_java_sql_builder >> enrich_data_task >> persist_to_oracle_task
