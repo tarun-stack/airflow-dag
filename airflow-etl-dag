@@ -1,14 +1,21 @@
 from airflow import DAG
-from airflow.operators.bash_operator import BashOperator
 from airflow.operators.python_operator import PythonOperator
+from airflow.providers.http.operators.http import SimpleHttpOperator
 from airflow.utils.dates import days_ago
 from airflow.models import Variable
 import subprocess
+import requests
+import time
 from datetime import timedelta
+
+# Stonebranch API configuration
+STONEBRANCH_API_URL = "https://your-stonebranch-uac-api-endpoint"
+STONEBRANCH_JOB_ID = "your-stonebranch-job-id"
+STONEBRANCH_API_KEY = Variable.get("STONEBRANCH_API_KEY")  # Store API key in Airflow Variables
 
 # Define the DAG
 dag = DAG(
-    'batch_job_pipeline',
+    'stonebranch_job_pipeline',
     default_args={
         'start_date': days_ago(1),
         'retries': 3,
@@ -18,10 +25,34 @@ dag = DAG(
     catchup=False
 )
 
-# Task 1: Wait for the batch job to complete
-wait_for_batch_job = BashOperator(
-    task_id='wait_for_batch_job',
-    bash_command='while [ ! -f /path/to/batch_job_complete.txt ]; do sleep 10; done',
+# Function to check Stonebranch job status
+def check_stonebranch_job_status(**kwargs):
+    headers = {
+        "Authorization": f"Bearer {STONEBRANCH_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    url = f"{STONEBRANCH_API_URL}/jobs/{STONEBRANCH_JOB_ID}/status"
+
+    while True:
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch job status: {response.text}")
+
+        job_status = response.json().get("status")
+        if job_status in ["COMPLETED", "SUCCESS"]:
+            print("Stonebranch job completed successfully.")
+            break
+        elif job_status in ["FAILED", "CANCELLED"]:
+            raise Exception(f"Stonebranch job failed with status: {job_status}")
+        else:
+            print(f"Job status: {job_status}. Waiting...")
+            time.sleep(10)  # Poll every 10 seconds
+
+# Task 1: Wait for Stonebranch job to complete
+wait_for_stonebranch_job = PythonOperator(
+    task_id='wait_for_stonebranch_job',
+    python_callable=check_stonebranch_job_status,
+    provide_context=True,
     dag=dag
 )
 
@@ -117,4 +148,4 @@ persist_to_oracle_task = PythonOperator(
 )
 
 # Define the task dependencies
-wait_for_batch_job >> run_java_sql_builder >> enrich_data_task >> persist_to_oracle_task
+wait_for_stonebranch_job >> run_java_sql_builder >> enrich_data_task >> persist_to_oracle_task
